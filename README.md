@@ -29,28 +29,50 @@ Labels enter the pipeline only in steps 3–5, for scoring.
 
 ## Results
 
-> Fill this table in from `results/metrics.json` after your run, and delete this
-> line. Do not commit the repository with placeholders in it.
+Dense autoencoder over log spectra, trained on 564 healthy windows at 1 hp.
+Threshold set at the 99th percentile of reconstruction error on 187 healthy
+calibration windows; a further 187 healthy windows were held out from both
+training and calibration and used only for the false-alarm measurement below.
 
-| | training load (0 hp) | unseen loads (1–3 hp) |
+| | 1 hp (training load) | unseen loads (0, 2, 3 hp) |
 |---|---|---|
-| ROC-AUC (dense AE, log-spectrum) | — | — |
-| True positive rate @ fixed threshold | — | — |
-| **False positive rate on healthy data** | — | — |
-| ROC-AUC (kurtosis baseline) | — | — |
-| False positive rate (kurtosis baseline) | — | — |
+| ROC-AUC, autoencoder | 1.000 | 1.000 |
+| True positive rate @ fixed threshold | 1.000 | 1.000 |
+| **False positive rate on healthy data** | **0.016** | **0.603** |
+| ROC-AUC, kurtosis baseline | 0.863 | 0.860 |
+| True positive rate, kurtosis baseline | 0.712 | 0.690 |
+| False positive rate, kurtosis baseline | 0.011 | 0.012 |
 
-False-alarm rate on healthy data, by motor load:
+False alarms on healthy data, by motor load:
+
+| load | 0 hp | 1 hp (trained) | 2 hp | 3 hp |
+|---|---|---|---|---|
+| false positive rate | 1.000 | 0.016 | 0.005 | 1.000 |
 
 ![false positives by load](results/fpr_by_load.png)
 
-The expected and important observation is that the false-positive rate rises
-once the operating condition moves away from the one the threshold was
-calibrated on. The autoencoder responds to *any* departure from the training
-distribution, and a load or speed change is such a departure. Reconstruction
-error is a novelty score, not a damage score — which is precisely why deployed
-condition monitoring needs either per-regime thresholds, operating-condition
-conditioning, or features that are invariant to load.
+Two things are worth drawing out.
+
+**The ranking is perfect everywhere; the calibration is not.** ROC-AUC is 1.000 at
+every operating condition, so reconstruction error separates damaged from healthy
+windows without exception. A threshold-free evaluation would report a flawless
+detector. Fixing the threshold on healthy data at one load and applying it
+elsewhere produces false alarms on 60% of healthy windows. AUC is measuring
+something the deployed system does not get to use.
+
+**Transfer is not a smooth function of operating distance.** The threshold holds at
+2 hp (0.5% false alarms) and collapses at 0 hp and 3 hp (100%). This is not
+ordered by shaft speed: 0 hp is nearer the training condition in rpm than 2 hp is,
+and at this window length the speed differences fall below one spectral bin in any
+case. Whatever separates the transferable conditions from the non-transferable
+ones is not the operating point, which means the operating point cannot be used to
+decide when the detector is trustworthy.
+
+**The scalar baseline inverts the trade-off.** Kurtosis detects far less (71% of
+faults against 100%) but its calibration barely moves under shift — 1.1% to 1.2%
+false alarms. Neither method dominates: the autoencoder is the better detector and
+the worse alarm, and any deployment would have to choose between missed faults and
+ignored alarms, or re-calibrate per operating regime.
 
 ## Running it
 
