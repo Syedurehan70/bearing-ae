@@ -1,4 +1,4 @@
-# 1-D convolutional autoencoder over raw time windows. Comparison run.
+# Dense autoencoder over log magnitude spectra. Primary configuration.
 seed: 1337
 device: auto
 
@@ -28,16 +28,16 @@ data:
       "48khz": 48000
 
 features:
-  representation: raw   # logspec | raw
+  representation: logspec   # logspec | raw
   window: 1024              # samples @ 12 kHz -> 85 ms, ~2.6 shaft revolutions
                             # spectral resolution 11.7 Hz, fine enough for BPFO/BPFI
   hop: 128                  # heavy overlap: the healthy baseline recordings are
                             # only 5-10 s long, so windows are the scarce resource
 
 model:
-  kind: conv               # dense | conv
-  channels: [16, 32]
-  latent: 16
+  kind: dense               # dense | conv
+  hidden: [128, 32]
+  latent: 8
 
 training:
   epochs: 60
