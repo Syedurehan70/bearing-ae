@@ -49,7 +49,7 @@ False alarms on healthy data, by motor load:
 |---|---|---|---|---|
 | false positive rate | 1.000 | 0.016 | 0.005 | 1.000 |
 
-![false positives by load](fpr_by_load.png)
+![false positives by load](results/fpr_by_load.png)
 
 Two things are worth drawing out.
 
