@@ -1,0 +1,58 @@
+# 1-D convolutional autoencoder over raw time windows. Comparison run.
+seed: 1337
+device: auto
+
+data:
+  # Directories searched recursively for CWRU .mat files.
+  # Kaggle: whatever /kaggle/input/<slug> your chosen mirror mounts at.
+  roots:
+    - /kaggle/input
+    - data/raw
+  channel: DE          # drive-end accelerometer
+  # Case-insensitive substring filters on the full path. Several mirrors ship
+  # 12 kHz and 48 kHz recordings side by side; mixing sampling rates silently
+  # corrupts every spectral feature. Set these once you have seen the layout.
+  include: []          # e.g. ["12k", "Normal"]
+  exclude: []          # e.g. ["48k_DE"] to drop the 48 kHz fault recordings
+
+  # CWRU stores no sampling rate inside the .mat files, and the archive mixes
+  # two: 12 kHz drive-end fault data, 48 kHz healthy baseline data. Everything
+  # is resampled to target_rate before any feature is computed. Verify the
+  # printed durations look sane (~5-25 s) before trusting a single metric.
+  target_rate: 12000
+  sample_rate:
+    default: 12000
+    normal_baseline: 48000       # healthy runs, unless a path rule matches
+    path_rules:
+      "48k": 48000
+      "48khz": 48000
+
+features:
+  representation: raw   # logspec | raw
+  window: 1024              # samples @ 12 kHz -> 85 ms, ~2.6 shaft revolutions
+                            # spectral resolution 11.7 Hz, fine enough for BPFO/BPFI
+  hop: 128                  # heavy overlap: the healthy baseline recordings are
+                            # only 5-10 s long, so windows are the scarce resource
+
+model:
+  kind: conv               # dense | conv
+  channels: [16, 32]
+  latent: 16
+
+training:
+  epochs: 60
+  batch_size: 128
+  lr: 0.001
+  patience: 8
+  min_delta: 1.0e-5
+  weight_decay: 1.0e-5
+
+experiment:
+  # Load 1 hp, not 0: the 0 hp healthy baseline is only ~5 s long, which leaves
+  # too few windows to fit anything without memorising them. Loads 0, 2 and 3
+  # then serve as the unseen operating conditions.
+  train_load: 1
+  calibration_fraction: 0.2   # healthy windows that fix the threshold
+  healthy_test_fraction: 0.2  # healthy windows touched by nothing but scoring
+  threshold_quantile: 0.99    # quantile of calibration error, labels never used
+  run_kurtosis_baseline: true

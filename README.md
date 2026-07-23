@@ -12,13 +12,15 @@ threshold survive a change in operating condition it was never calibrated on?**
 
 ## Protocol
 
-1. Train the autoencoder on healthy windows recorded at **one** motor load
-   (0 hp by default). No faulty window is seen during training.
-2. Fix the anomaly threshold at the 99th percentile of reconstruction error on a
-   held-out **healthy** split at that same load. Fault labels are never used to
-   select the threshold.
+1. Split the healthy windows recorded at **one** motor load (1 hp by default)
+   three ways: train, calibrate, test. No faulty window is seen during training.
+2. Fix the anomaly threshold at the 99th percentile of reconstruction error on
+   the **calibration** split. Fault labels are never used to select it. The
+   healthy **test** split is touched by neither training nor calibration, so the
+   false-alarm rate at the training load is an independent measurement rather
+   than a restatement of the quantile that defined the threshold.
 3. Score faults at the training load — the easy, usually-reported case.
-4. Score healthy **and** faulty data at the three unseen loads (1, 2, 3 hp), and
+4. Score healthy **and** faulty data at the three unseen loads (0, 2, 3 hp), and
    report the false-alarm rate on healthy data at each load separately.
 5. Run the same protocol with a spectral-kurtosis-style scalar detector, so the
    autoencoder has an honest baseline to beat rather than being reported alone.
@@ -36,6 +38,7 @@ Labels enter the pipeline only in steps 3–5, for scoring.
 | True positive rate @ fixed threshold | — | — |
 | **False positive rate on healthy data** | — | — |
 | ROC-AUC (kurtosis baseline) | — | — |
+| False positive rate (kurtosis baseline) | — | — |
 
 False-alarm rate on healthy data, by motor load:
 
@@ -81,7 +84,11 @@ dataset.
 - **Windows are RMS-normalised before featurisation.** Without this, the model
   can separate healthy from faulty on overall vibration energy alone, and the
   reported numbers say nothing about whether the autoencoder learned structure.
-- **The bottleneck is small (16 units).** A wide bottleneck approaches the
+- **Training uses the 1 hp baseline, not 0 hp.** The 0 hp healthy recording is
+  roughly five seconds long. Fitting an autoencoder to the few dozen windows it
+  yields produces a model that has memorised its training set, and every
+  subsequent number is an artifact of that rather than a property of the method.
+- **The bottleneck is small (8 units).** A wide bottleneck approaches the
   identity function and reconstructs faults as accurately as healthy data,
   which quietly destroys the detector.
 - **The threshold is a quantile of healthy validation error**, not the value
@@ -101,6 +108,10 @@ dataset.
   computable from geometry and shaft speed here, and an envelope-spectrum
   detector built on them is the correct engineering baseline. It is not
   implemented in this repository.
+- Healthy data is scarce. A single CWRU baseline recording is 5-10 s, which
+  after windowing leaves a few hundred training windows with heavy overlap
+  between them. They are not independent samples, and the model remains
+  overparameterised relative to them.
 - Two-hour project. The point was a clean protocol and an honest failure mode,
   not a state-of-the-art number.
 
