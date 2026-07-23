@@ -1,81 +1,231 @@
-"""Turn raw vibration traces into fixed-length windows and features.
+"""End-to-end experiment.
 
-Two representations are supported so the autoencoder result can be compared
-against a like-for-like alternative rather than reported in isolation:
+Protocol
+--------
+1. Train an autoencoder on healthy windows from ONE motor load only.
+2. Set the anomaly threshold from a held-out healthy split at that same load.
+3. Report detection on faults at the training load (the easy case).
+4. Report false alarms and detection at the three unseen loads (the honest case).
 
-* ``raw``      -- amplitude-normalised time windows (input to the 1-D conv AE)
-* ``logspec``  -- log magnitude spectrum of each window (input to the dense AE)
-
-Per-window amplitude normalisation is deliberate: without it the model can
-separate healthy from faulty on overall vibration energy alone, which is a
-trivial detector and tells you nothing about whether the AE learned structure.
+Fault labels enter the pipeline only at step 3/4, for scoring.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import logging
+from pathlib import Path
+
 import numpy as np
+import torch
+import yaml
+
+try:  # works both as `python -m src.main` and as a flat script on Kaggle
+    from . import data, evaluate, features, models, train
+except ImportError:  # pragma: no cover
+    import data, evaluate, features, models, train  # type: ignore
+
+log = logging.getLogger("bearing-ae")
 
 
-def window(signal: np.ndarray, size: int, hop: int) -> np.ndarray:
-    """Split a 1-D signal into overlapping windows -> (n_windows, size)."""
-    if signal.size < size:
-        return np.empty((0, size))
-    n = 1 + (signal.size - size) // hop
-    idx = np.arange(size)[None, :] + hop * np.arange(n)[:, None]
-    return signal[idx]
+def load_config(path: str | Path) -> dict:
+    with open(path) as handle:
+        return yaml.safe_load(handle)
 
 
-def normalise_windows(windows: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Zero-mean, unit-RMS each window independently."""
-    centred = windows - windows.mean(axis=1, keepdims=True)
-    rms = np.sqrt((centred**2).mean(axis=1, keepdims=True))
-    return centred / (rms + eps)
+def build_windows(runs: list[data.Run], cfg: dict) -> dict[str, np.ndarray]:
+    """Featurise every run and stack, keeping provenance for each window."""
+    feats, faulty, loads, labels = [], [], [], []
+    for run in runs:
+        x = features.featurise(run.signal, cfg["features"])
+        if x.size == 0:
+            continue
+        feats.append(x)
+        faulty.append(np.full(len(x), not run.is_healthy))
+        loads.append(np.full(len(x), run.load))
+        labels.append(np.full(len(x), run.label, dtype=object))
+    return {
+        "x": np.concatenate(feats),
+        "faulty": np.concatenate(faulty),
+        "load": np.concatenate(loads),
+        "label": np.concatenate(labels),
+    }
 
 
-def log_spectrum(windows: np.ndarray, eps: float = 1e-10) -> np.ndarray:
-    """One-sided log magnitude spectrum, DC bin dropped -> (n, size//2)."""
-    tapered = windows * np.hanning(windows.shape[1])[None, :]
-    magnitude = np.abs(np.fft.rfft(tapered, axis=1))[:, 1:]
-    return np.log(magnitude + eps)
+def run(cfg: dict, out_dir: Path) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train.set_seed(cfg["seed"])
+    device = "cuda" if torch.cuda.is_available() and cfg["device"] == "auto" else "cpu"
+    log.info("device: %s", device)
+
+    runs = data.discover_runs(
+        cfg["data"]["roots"],
+        channel=cfg["data"]["channel"],
+        include=cfg["data"].get("include"),
+        exclude=cfg["data"].get("exclude"),
+        rate_rules=cfg["data"].get("sample_rate", {}),
+        target_rate=cfg["data"].get("target_rate", 12_000),
+    )
+    if not runs:
+        raise SystemExit(
+            "No labelled .mat files found. Check config['data']['roots'] -- on "
+            "Kaggle this is usually /kaggle/input/<dataset-slug>."
+        )
+    log.info("\n%s", data.summarise(runs))
+    if not any(r.is_healthy for r in runs):
+        raise SystemExit("No healthy runs found; cannot train an unsupervised detector.")
+
+    bundle = build_windows(runs, cfg)
+    train_load = cfg["experiment"]["train_load"]
+
+    # Three-way split of the healthy data at the training load. The calibration
+    # split fixes the threshold and drives early stopping; the test split is
+    # never seen by either, so the false-positive rate at the training load is
+    # an independent measurement rather than a restatement of the quantile.
+    healthy_at_train = (~bundle["faulty"]) & (bundle["load"] == train_load)
+    idx = np.flatnonzero(healthy_at_train)
+    rng = np.random.default_rng(cfg["seed"])
+    rng.shuffle(idx)
+    n_cal = max(2, int(len(idx) * cfg["experiment"]["calibration_fraction"]))
+    n_test = max(2, int(len(idx) * cfg["experiment"]["healthy_test_fraction"]))
+    cal_idx, test_idx, train_idx = idx[:n_cal], idx[n_cal : n_cal + n_test], idx[n_cal + n_test :]
+    log.info(
+        "healthy windows at %d hp -- train %d | calibrate %d | test %d",
+        train_load, len(train_idx), len(cal_idx), len(test_idx),
+    )
+    if len(train_idx) < 100:
+        log.warning(
+            "only %d healthy training windows; reduce features.hop or pick a "
+            "training load with a longer baseline recording", len(train_idx)
+        )
+    val_idx = cal_idx  # early stopping also uses healthy-only data
+
+    scaler = features.StandardScaler().fit(bundle["x"][train_idx])
+    x_all = scaler.transform(bundle["x"])
+
+    model = models.build_model(cfg, input_dim=x_all.shape[1])
+    n_params = sum(p.numel() for p in model.parameters())
+    log.info("model %s | %d parameters", cfg["model"]["kind"], n_params)
+
+    history = train.train_autoencoder(
+        model, x_all[train_idx], x_all[val_idx], cfg, device=device
+    )
+    evaluate.plot_history(history, out_dir / "training_curve.png")
+
+    scores = train.reconstruction_error(model, x_all, device=device)
+    threshold = evaluate.choose_threshold(
+        scores[val_idx], cfg["experiment"]["threshold_quantile"]
+    )
+    log.info("threshold (healthy val, q=%.3f): %.6g", cfg["experiment"]["threshold_quantile"], threshold)
+
+    results: dict = {
+        "config": cfg,
+        "n_parameters": n_params,
+        "n_healthy_train_windows": int(len(train_idx)),
+        "n_healthy_calibration_windows": int(len(cal_idx)),
+        "n_healthy_test_windows": int(len(test_idx)),
+        "threshold": threshold,
+        "epochs_run": len(history["train"]),
+    }
+
+    # --- 1. same operating condition as training --------------------------
+    same = bundle["load"] == train_load
+    held_out = np.ones(len(scores), dtype=bool)
+    held_out[train_idx] = False  # never score windows the model trained on
+    held_out[cal_idx] = False  # nor the windows that fixed the threshold
+    mask = same & held_out
+    results["same_load"] = evaluate.detection_metrics(
+        scores[mask], bundle["faulty"][mask], threshold
+    )
+    results["same_load"]["recall_by_fault"] = evaluate.per_group_recall(
+        scores[mask & bundle["faulty"]], bundle["label"][mask & bundle["faulty"]], threshold
+    )
+    evaluate.plot_score_distributions(
+        scores[mask],
+        bundle["faulty"][mask],
+        threshold,
+        out_dir / "scores_train_load.png",
+        f"Reconstruction error, {train_load} hp (training condition)",
+    )
+
+    # --- 2. unseen operating conditions -----------------------------------
+    shifted = (bundle["load"] != train_load) & held_out
+    if shifted.any():
+        results["shifted_load"] = evaluate.detection_metrics(
+            scores[shifted], bundle["faulty"][shifted], threshold
+        )
+        evaluate.plot_score_distributions(
+            scores[shifted],
+            bundle["faulty"][shifted],
+            threshold,
+            out_dir / "scores_shifted_loads.png",
+            "Reconstruction error, unseen motor loads",
+        )
+
+    fpr_by_load: dict[int, float] = {}
+    for load in sorted(set(bundle["load"].tolist())):
+        sel = (bundle["load"] == load) & ~bundle["faulty"] & held_out
+        if sel.any():
+            fpr_by_load[int(load)] = float((scores[sel] > threshold).mean())
+    results["false_positive_rate_by_load"] = fpr_by_load
+    if len(fpr_by_load) > 1:
+        evaluate.plot_fpr_by_load(fpr_by_load, train_load, out_dir / "fpr_by_load.png")
+
+    # --- 3. cheap baseline -------------------------------------------------
+    if cfg["experiment"]["run_kurtosis_baseline"]:
+        results["kurtosis_baseline"] = _kurtosis_baseline(runs, cfg, bundle)
+
+    with open(out_dir / "metrics.json", "w") as handle:
+        json.dump(results, handle, indent=2, default=str)
+    torch.save(model.state_dict(), out_dir / "autoencoder.pt")
+    log.info("results written to %s", out_dir)
+    return results
 
 
-def featurise(signal: np.ndarray, cfg: dict) -> np.ndarray:
-    """Apply the configured representation to one raw trace."""
-    windows = normalise_windows(window(signal, cfg["window"], cfg["hop"]))
-    if cfg["representation"] == "raw":
-        return windows.astype(np.float32)
-    if cfg["representation"] == "logspec":
-        return log_spectrum(windows).astype(np.float32)
-    raise ValueError(f"unknown representation: {cfg['representation']!r}")
+def _kurtosis_baseline(runs: list[data.Run], cfg: dict, bundle: dict) -> dict:
+    """Spectral kurtosis-style scalar detector, same protocol as the AE."""
+    kurt, faulty, loads = [], [], []
+    for r in runs:
+        w = features.window(r.signal, cfg["features"]["window"], cfg["features"]["hop"])
+        if w.size == 0:
+            continue
+        kurt.append(features.rms_baseline(w))
+        faulty.append(np.full(len(w), not r.is_healthy))
+        loads.append(np.full(len(w), r.load))
+    kurt = np.concatenate(kurt)
+    faulty = np.concatenate(faulty)
+    loads = np.concatenate(loads)
+
+    train_load = cfg["experiment"]["train_load"]
+    healthy_train = (~faulty) & (loads == train_load)
+    threshold = float(
+        np.quantile(kurt[healthy_train], cfg["experiment"]["threshold_quantile"])
+    )
+    same = loads == train_load
+    out = evaluate.detection_metrics(kurt[same], faulty[same], threshold)
+    out["threshold"] = threshold
+    shifted = loads != train_load
+    if shifted.any():
+        out["shifted_load"] = evaluate.detection_metrics(
+            kurt[shifted], faulty[shifted], threshold
+        )
+    return out
 
 
-class StandardScaler:
-    """Feature-wise standardisation, fitted on healthy training data only."""
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs/dense_logspec.yaml")
+    parser.add_argument("--out", default="results")
+    args = parser.parse_args()
 
-    def __init__(self) -> None:
-        self.mean_: np.ndarray | None = None
-        self.scale_: np.ndarray | None = None
-
-    def fit(self, x: np.ndarray) -> "StandardScaler":
-        self.mean_ = x.mean(axis=0)
-        self.scale_ = x.std(axis=0) + 1e-8
-        return self
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        if self.mean_ is None or self.scale_ is None:
-            raise RuntimeError("scaler not fitted")
-        return ((x - self.mean_) / self.scale_).astype(np.float32)
-
-    def fit_transform(self, x: np.ndarray) -> np.ndarray:
-        return self.fit(x).transform(x)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+    )
+    cfg = load_config(args.config)
+    results = run(cfg, Path(args.out))
+    print(json.dumps({k: v for k, v in results.items() if k != "config"}, indent=2, default=str))
 
 
-def rms_baseline(windows_raw: np.ndarray) -> np.ndarray:
-    """Kurtosis of each unnormalised window -- the classic cheap detector.
-
-    Included so the autoencoder has something honest to beat.
-    """
-    centred = windows_raw - windows_raw.mean(axis=1, keepdims=True)
-    variance = (centred**2).mean(axis=1)
-    fourth = (centred**4).mean(axis=1)
-    return fourth / (variance**2 + 1e-12)
+if __name__ == "__main__":
+    main()
