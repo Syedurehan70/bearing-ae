@@ -1,0 +1,111 @@
+{
+  "config": {
+    "seed": 1337,
+    "device": "auto",
+    "data": {
+      "roots": [
+        "/kaggle/input/datasets/sufian79/cwru-mat-full-dataset"
+      ],
+      "channel": "DE",
+      "include": [],
+      "exclude": [],
+      "target_rate": 12000,
+      "sample_rate": {
+        "default": 12000,
+        "normal_baseline": 48000,
+        "path_rules": {
+          "48k": 48000,
+          "48khz": 48000
+        }
+      }
+    },
+    "features": {
+      "representation": "logspec",
+      "window": 1024,
+      "hop": 128
+    },
+    "model": {
+      "kind": "dense",
+      "hidden": [
+        128,
+        32
+      ],
+      "latent": 8
+    },
+    "training": {
+      "epochs": 60,
+      "batch_size": 128,
+      "lr": 0.001,
+      "patience": 8,
+      "min_delta": 1e-05,
+      "weight_decay": 1e-05
+    },
+    "experiment": {
+      "train_load": 1,
+      "calibration_fraction": 0.2,
+      "healthy_test_fraction": 0.2,
+      "threshold_quantile": 0.99,
+      "run_kurtosis_baseline": true
+    }
+  },
+  "n_parameters": 140616,
+  "n_healthy_train_windows": 564,
+  "n_healthy_calibration_windows": 187,
+  "n_healthy_test_windows": 187,
+  "threshold": 1.214448094367981,
+  "epochs_run": 47,
+  "same_load": {
+    "n_windows": 8692,
+    "n_healthy": 187,
+    "n_faulty": 8505,
+    "false_positive_rate": 0.016042780748663103,
+    "true_positive_rate": 1.0,
+    "roc_auc": 1.0,
+    "average_precision": 0.9999999999999999,
+    "recall_by_fault": {
+      "ball_0.007_1hp": 1.0,
+      "ball_0.014_1hp": 1.0,
+      "ball_0.021_1hp": 1.0,
+      "inner_race_0.007_1hp": 1.0,
+      "inner_race_0.014_1hp": 1.0,
+      "inner_race_0.021_1hp": 1.0,
+      "outer_race@6_0.007_1hp": 1.0,
+      "outer_race@6_0.014_1hp": 1.0,
+      "outer_race@6_0.021_1hp": 1.0
+    }
+  },
+  "shifted_load": {
+    "n_windows": 27881,
+    "n_healthy": 2348,
+    "n_faulty": 25533,
+    "false_positive_rate": 0.6026405451448041,
+    "true_positive_rate": 1.0,
+    "roc_auc": 1.0,
+    "average_precision": 1.0
+  },
+  "false_positive_rate_by_load": {
+    "0": 1.0,
+    "1": 0.016042780748663103,
+    "2": 0.005330490405117271,
+    "3": 1.0
+  },
+  "kurtosis_baseline": {
+    "n_windows": 9443,
+    "n_healthy": 938,
+    "n_faulty": 8505,
+    "false_positive_rate": 0.010660980810234541,
+    "true_positive_rate": 0.7119341563786008,
+    "roc_auc": 0.862966472750884,
+    "average_precision": 0.9846697498017161,
+    "threshold": 3.488317117233135,
+    "shifted_load": {
+      "n_windows": 27881,
+      "n_healthy": 2348,
+      "n_faulty": 25533,
+      "false_positive_rate": 0.01192504258943782,
+      "true_positive_rate": 0.6904398229741903,
+      "roc_auc": 0.8597862064598769,
+      "average_precision": 0.9865895017642721
+    }
+  }
+}
