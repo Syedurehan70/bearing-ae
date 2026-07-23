@@ -1,86 +1,97 @@
-"""Autoencoder architectures.
-
-Both are deliberately small. The point of the experiment is the evaluation
-protocol, not capacity: a bottleneck that is too wide simply learns the identity
-function and reconstructs faults as well as it reconstructs healthy data.
-"""
-
 from __future__ import annotations
 
+import logging
+import random
+
+import numpy as np
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+log = logging.getLogger(__name__)
 
 
-class DenseAE(nn.Module):
-    """Fully-connected autoencoder for spectral inputs."""
-
-    def __init__(self, input_dim: int, hidden: list[int], latent: int) -> None:
-        super().__init__()
-        encoder_layers: list[nn.Module] = []
-        prev = input_dim
-        for width in hidden:
-            encoder_layers += [nn.Linear(prev, width), nn.ReLU()]
-            prev = width
-        encoder_layers.append(nn.Linear(prev, latent))
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        decoder_layers: list[nn.Module] = []
-        prev = latent
-        for width in reversed(hidden):
-            decoder_layers += [nn.Linear(prev, width), nn.ReLU()]
-            prev = width
-        decoder_layers.append(nn.Linear(prev, input_dim))
-        self.decoder = nn.Sequential(*decoder_layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decoder(self.encoder(x))
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-class ConvAE(nn.Module):
-    """1-D convolutional autoencoder for raw time windows."""
+def train_autoencoder(
+    model: nn.Module,
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    cfg: dict,
+    device: str = "cpu",
+) -> dict[str, list[float]]:
+    train_cfg = cfg["training"]
+    model.to(device)
 
-    def __init__(self, input_dim: int, channels: list[int], latent: int) -> None:
-        super().__init__()
-        encoder_layers: list[nn.Module] = []
-        prev = 1
-        for width in channels:
-            encoder_layers += [
-                nn.Conv1d(prev, width, kernel_size=9, stride=4, padding=4),
-                nn.ReLU(),
-            ]
-            prev = width
-        self.conv = nn.Sequential(*encoder_layers)
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(x_train)),
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        drop_last=False,
+    )
+    val_tensor = torch.from_numpy(x_val).to(device)
 
-        reduced = input_dim // (4 ** len(channels))
-        self.flat_dim = prev * reduced
-        self.to_latent = nn.Linear(self.flat_dim, latent)
-        self.from_latent = nn.Linear(latent, self.flat_dim)
-        self._shape = (prev, reduced)
+    optimiser = torch.optim.Adam(
+        model.parameters(),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg.get("weight_decay", 0.0),
+    )
+    criterion = nn.MSELoss()
 
-        decoder_layers: list[nn.Module] = []
-        widths = list(reversed(channels))
-        for i, width in enumerate(widths):
-            out = widths[i + 1] if i + 1 < len(widths) else 1
-            decoder_layers += [
-                nn.ConvTranspose1d(
-                    width, out, kernel_size=9, stride=4, padding=4, output_padding=3
-                )
-            ]
-            if i + 1 < len(widths):
-                decoder_layers.append(nn.ReLU())
-        self.deconv = nn.Sequential(*decoder_layers)
+    history: dict[str, list[float]] = {"train": [], "val": []}
+    best_val = float("inf")
+    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+    patience_left = train_cfg["patience"]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv(x.unsqueeze(1))
-        z = self.to_latent(h.flatten(1))
-        h = self.from_latent(z).view(-1, *self._shape)
-        return self.deconv(h).squeeze(1)
+    for epoch in range(1, train_cfg["epochs"] + 1):
+        model.train()
+        running = 0.0
+        for (batch,) in loader:
+            batch = batch.to(device)
+            optimiser.zero_grad()
+            loss = criterion(model(batch), batch)
+            loss.backward()
+            optimiser.step()
+            running += loss.item() * batch.shape[0]
+        train_loss = running / len(loader.dataset)
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = criterion(model(val_tensor), val_tensor).item()
+
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        log.info("epoch %3d | train %.5f | val %.5f", epoch, train_loss, val_loss)
+
+        if val_loss < best_val - train_cfg["min_delta"]:
+            best_val = val_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            patience_left = train_cfg["patience"]
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                log.info("early stopping at epoch %d", epoch)
+                break
+
+    model.load_state_dict(best_state)
+    return history
 
 
-def build_model(cfg: dict, input_dim: int) -> nn.Module:
-    kind = cfg["model"]["kind"]
-    if kind == "dense":
-        return DenseAE(input_dim, cfg["model"]["hidden"], cfg["model"]["latent"])
-    if kind == "conv":
-        return ConvAE(input_dim, cfg["model"]["channels"], cfg["model"]["latent"])
-    raise ValueError(f"unknown model kind: {kind!r}")
+@torch.no_grad()
+def reconstruction_error(
+    model: nn.Module, x: np.ndarray, device: str = "cpu", batch_size: int = 512
+) -> np.ndarray:
+    """Per-window mean squared reconstruction error."""
+    model.eval().to(device)
+    errors = []
+    for start in range(0, len(x), batch_size):
+        batch = torch.from_numpy(x[start : start + batch_size]).to(device)
+        recon = model(batch)
+        errors.append(((recon - batch) ** 2).mean(dim=1).cpu().numpy())
+    return np.concatenate(errors) if errors else np.empty(0)
